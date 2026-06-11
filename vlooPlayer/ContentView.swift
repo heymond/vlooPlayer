@@ -4,7 +4,7 @@ import UIKit
 
 struct ContentView: View {
     private let overlayDisplayDuration: Double = 3
-    private let landscapeSectionDisplayDuration: Double = 1
+    private let landscapeSectionDisplayDuration: Double = 2 //섹션선택 유지시간
 
     @StateObject private var model = LoopPlaybackModel()
     @State private var isShowingDocumentPicker = false
@@ -120,6 +120,13 @@ struct ContentView: View {
                     .font(.headline)
                     .foregroundStyle(.blue)
                 Spacer()
+                Button {
+                    model.undoLastMarkerDeletion()
+                } label: {
+                    Label("Undo", systemImage: "arrow.uturn.backward")
+                }
+                .disabled(!model.canUndoMarkerDeletion)
+
                 Button("Delete All", role: .destructive) {
                     model.removeAllMarkers()
                 }
@@ -129,25 +136,40 @@ struct ContentView: View {
             .frame(height: 42)
             .background(Color(.systemBackground))
 
-            List {
-                ForEach(model.segments) { segment in
-                    segmentRow(for: segment, compact: false)
-                        .listRowInsets(EdgeInsets())
-                        .listRowSeparator(.hidden)
-                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                            Button(role: .destructive) {
-                                model.removeSegments(at: IndexSet(integer: segment.index))
-                            } label: {
-                                Label("Delete", systemImage: "trash")
+            ScrollViewReader { proxy in
+                List {
+                    ForEach(model.segments) { segment in
+                        segmentRow(for: segment, compact: false)
+                            .id(segment.index)
+                            .listRowInsets(EdgeInsets())
+                            .listRowSeparator(.hidden)
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    model.removeSegments(at: IndexSet(integer: segment.index))
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                                .disabled(model.markers.isEmpty)
                             }
-                            .disabled(model.markers.isEmpty)
-                        }
+                    }
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+                .contentMargins(.vertical, 150, for: .scrollContent)
+                .background(Color(.systemBackground))
+                .frame(height: 350)
+                .onAppear {
+                    if let activeIndex = model.activeSegmentIndex {
+                        proxy.scrollTo(activeIndex, anchor: .center)
+                    }
+                }
+                .onChange(of: model.activeSegmentIndex) { _, activeIndex in
+                    guard let activeIndex else { return }
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        proxy.scrollTo(activeIndex, anchor: .center)
+                    }
                 }
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-            .background(Color(.systemBackground))
-            .frame(height: 350)
         }
     }
 
@@ -212,7 +234,7 @@ struct ContentView: View {
     }
 
     private func transportControls(isLandscape: Bool) -> some View {
-        HStack(spacing: isLandscape ? 38 : 28) {
+        HStack(spacing: isLandscape ? 24 : 16) {
             Button {
                 model.previousSubtitle()
                 keepControlsVisible(isLandscape: isLandscape)
@@ -248,6 +270,32 @@ struct ContentView: View {
             }
             .accessibilityLabel("Add section marker")
 
+            Button(action: {}) {
+                ZStack {
+                    Image(systemName: "bookmark.fill")
+
+                    Text("AUTO")
+                        .font(.system(size: 7, weight: .black, design: .rounded))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.cyan, in: Capsule())
+                }
+                .frame(width: 34, height: 32)
+            }
+            .simultaneousGesture(
+                LongPressGesture(minimumDuration: 1)
+                    .onEnded { _ in
+                        model.addAutomaticSubtitleMarkers()
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        keepControlsVisible(isLandscape: isLandscape)
+                    }
+            )
+            .disabled(!model.hasSubtitles)
+            .opacity(model.hasSubtitles ? 1 : 0.45)
+            .accessibilityLabel("Automatically mark different subtitle lines")
+            .accessibilityHint("Press and hold for one second")
+
             Button {
                 model.toggleSubtitles()
                 keepControlsVisible(isLandscape: isLandscape)
@@ -262,6 +310,7 @@ struct ContentView: View {
         .font(.system(size: isLandscape ? 24 : 22, weight: .semibold))
         .foregroundStyle(isLandscape ? Color.white : Color.primary)
         .buttonStyle(ControlPressButtonStyle(normalColor: isLandscape ? .white : .primary))
+        .padding(.horizontal, isLandscape ? 32 : 24)
     }
 
     private func playbackTimeline(isLandscape: Bool) -> some View {
@@ -407,16 +456,15 @@ struct ContentView: View {
                     transportControls(isLandscape: true)
 
                     subtitleSyncControls(isLandscape: true)
-
-                    playbackTimeline(isLandscape: true)
-                        .containerRelativeFrame(.horizontal) { width, _ in
-                            width * 0.8
-                        }
-                        .padding(.top, 10)
                 }
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.horizontal, 38)
-                .padding(.vertical, 14)
+
+                playbackTimeline(isLandscape: true)
+                    .containerRelativeFrame(.horizontal) { width, _ in
+                        width * 0.8
+                    }
+                    .offset(y: 90)
             }
 
             if areLandscapeSegmentsVisible {
@@ -437,20 +485,32 @@ struct ContentView: View {
                 .font(.caption.monospacedDigit().bold())
                 .foregroundStyle(.white)
 
-            ScrollView(.vertical, showsIndicators: false) {
-                LazyVStack(spacing: 6) {
-                    ForEach(model.segments) { segment in
-                        segmentRow(for: segment, compact: true)
-                            .frame(width: 100)
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    LazyVStack(spacing: 6) {
+                        ForEach(model.segments) { segment in
+                            segmentRow(for: segment, compact: true)
+                                .frame(width: 100)
+                                .id(segment.index)
+                        }
+                    }
+                    .padding(.vertical, 96)
+                }
+                .frame(width: 100, height: 234)
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 8)
+                        .onChanged { _ in showLandscapeOverlays() }
+                        .onEnded { _ in showLandscapeOverlays() }
+                )
+                .onAppear {
+                    proxy.scrollTo(model.selectedSegmentIndex, anchor: .center)
+                }
+                .onChange(of: model.selectedSegmentIndex) { _, selectedIndex in
+                    withAnimation(.easeInOut(duration: 0.22)) {
+                        proxy.scrollTo(selectedIndex, anchor: .center)
                     }
                 }
             }
-            .frame(width: 100, height: 234)
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 8)
-                    .onChanged { _ in showLandscapeOverlays() }
-                    .onEnded { _ in showLandscapeOverlays() }
-            )
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -522,18 +582,37 @@ struct ContentView: View {
                 HStack {
                     Text("Section \(segment.index + 1)")
                         .font(.system(size: 16, weight: .semibold))
-                    Spacer()
+
+                    if let subtitleText = subtitlePreview(for: segment) {
+                        Text(subtitleText)
+                            .font(.system(size: 15)) //세로모드 섹션바 자막크기
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        Spacer(minLength: 0)
+                    }
+
                     Text("\(formattedTime(segment.start)) - \(formattedTime(segment.end))")
                         .font(.system(size: 14).monospacedDigit())
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
                 .padding(.horizontal, 16)
-                .frame(minHeight: 50)
+                .frame(minHeight: 58)
                 .background(isCurrent ? Color.gray.opacity(0.34) : Color(.systemBackground))
                 .contentShape(Rectangle())
             }
         }
         .buttonStyle(.plain)
+    }
+
+    private func subtitlePreview(for segment: LoopSegment) -> String? {
+        model.subtitles.first { subtitle in
+            let start = subtitle.start + model.subtitleOffset
+            return start >= segment.start && start < segment.end
+        }?.text.replacingOccurrences(of: "\n", with: " ")
     }
 
     private var currentSectionLabel: String {

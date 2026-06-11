@@ -26,6 +26,7 @@ final class LoopPlaybackModel: ObservableObject {
     @Published var markers: [Double] = []
     @Published var selectedSegmentIndex: Int = 0
     @Published var repeatCount: Int = 0
+    @Published private(set) var lastFiniteRepeatCount: Int = 1
     @Published var isInfiniteRepeat: Bool = false
     @Published var completedRepeats: Int = 0
     @Published var isPlaying: Bool = false {
@@ -35,6 +36,7 @@ final class LoopPlaybackModel: ObservableObject {
     @Published var isSubtitleVisible: Bool = true
     @Published var subtitleURL: URL?
     @Published var subtitleOffset: Double = 0
+    @Published private(set) var canUndoMarkerDeletion = false
 
     private var timeObserver: Any?
     private var durationObservation: NSKeyValueObservation?
@@ -44,10 +46,17 @@ final class LoopPlaybackModel: ObservableObject {
     private var isTransitioningSegment = false
     private var remoteCommandTargets: [Any] = []
     private var lastNowPlayingUpdateSecond: Int = -1
+    private var markerDeletionHistory: [[Double]] = []
 
     private enum RecentFileKey {
         static let videoBookmark = "recentVideoBookmark"
         static let subtitleBookmark = "recentSubtitleBookmark"
+    }
+
+    private enum PlaybackSettingKey {
+        static let repeatCount = "lastRepeatCount"
+        static let finiteRepeatCount = "lastFiniteRepeatCount"
+        static let isInfiniteRepeat = "lastInfiniteRepeat"
     }
 
     private struct PersistedPlaybackState: Codable {
@@ -94,7 +103,7 @@ final class LoopPlaybackModel: ObservableObject {
     }
 
     var finiteRepeatDisplayCount: Int {
-        [1, 3, 5].contains(repeatCount) ? repeatCount : 1
+        [1, 3, 5].contains(repeatCount) ? repeatCount : lastFiniteRepeatCount
     }
 
     var targetPlaybackCount: Int {
@@ -126,6 +135,7 @@ final class LoopPlaybackModel: ObservableObject {
         player.automaticallyWaitsToMinimizeStalling = false
         configureRemoteCommands()
         installTimeObserver()
+        restoreRepeatSetting()
         loadRecentVideoIfAvailable()
     }
 
@@ -142,6 +152,8 @@ final class LoopPlaybackModel: ObservableObject {
         hasAccessedSecurityScopedResource = url.startAccessingSecurityScopedResource()
         videoURL = url
         markers = []
+        markerDeletionHistory = []
+        canUndoMarkerDeletion = false
         subtitles = []
         subtitleURL = nil
         subtitleOffset = 0
@@ -186,6 +198,36 @@ final class LoopPlaybackModel: ObservableObject {
         addMarker(at: currentTime)
     }
 
+    func addAutomaticSubtitleMarkers() {
+        guard duration > 0, !subtitles.isEmpty else { return }
+
+        var previousDialogue: String?
+        var automaticMarkers: [Double] = []
+
+        for subtitle in subtitles {
+            let dialogue = subtitle.text
+                .lowercased()
+                .split(whereSeparator: { $0.isWhitespace })
+                .joined(separator: " ")
+
+            guard !dialogue.isEmpty, dialogue != previousDialogue else { continue }
+            previousDialogue = dialogue
+
+            let markerTime = min(max(subtitle.start + subtitleOffset, 0), duration)
+            guard markerTime > 0.05, markerTime < duration - 0.05 else { continue }
+            guard !automaticMarkers.contains(where: { abs($0 - markerTime) < 0.25 }) else { continue }
+            automaticMarkers.append(markerTime)
+        }
+
+        guard !automaticMarkers.isEmpty else { return }
+        markers.append(contentsOf: automaticMarkers.filter { marker in
+            !markers.contains(where: { abs($0 - marker) < 0.25 })
+        })
+        markers.sort()
+        syncSelectedSegmentToCurrentTime()
+        savePlaybackState()
+    }
+
     func addMarker(at time: Double) {
         guard duration > 0 else { return }
         let clampedTime = min(max(time, 0), duration)
@@ -204,7 +246,12 @@ final class LoopPlaybackModel: ObservableObject {
     }
 
     func removeMarker(_ marker: Double) {
-        markers.removeAll { abs($0 - marker) < 0.01 }
+        let removedMarkers = markers.filter { abs($0 - marker) < 0.01 }
+        guard !removedMarkers.isEmpty else { return }
+        recordMarkerDeletion(removedMarkers)
+        markers.removeAll { candidate in
+            removedMarkers.contains(where: { abs($0 - candidate) < 0.01 })
+        }
         syncSelectedSegmentToCurrentTime()
         savePlaybackState()
     }
@@ -217,17 +264,43 @@ final class LoopPlaybackModel: ObservableObject {
             return segment.index == 0 ? markerMatching(segment.end) : markerMatching(segment.start)
         }
 
-        for marker in markersToRemove {
-            removeMarker(marker)
+        guard !markersToRemove.isEmpty else { return }
+        recordMarkerDeletion(markersToRemove)
+        markers.removeAll { marker in
+            markersToRemove.contains(where: { abs($0 - marker) < 0.01 })
         }
+        syncSelectedSegmentToCurrentTime()
+        savePlaybackState()
     }
 
     func removeAllMarkers() {
+        guard !markers.isEmpty else { return }
+        recordMarkerDeletion(markers)
         markers.removeAll()
         selectedSegmentIndex = 0
         completedRepeats = 0
         isTransitioningSegment = false
         savePlaybackState()
+    }
+
+    func undoLastMarkerDeletion() {
+        guard let deletedMarkers = markerDeletionHistory.popLast() else { return }
+        markers.append(contentsOf: deletedMarkers.filter { deletedMarker in
+            !markers.contains(where: { abs($0 - deletedMarker) < 0.01 })
+        })
+        markers.sort()
+        canUndoMarkerDeletion = !markerDeletionHistory.isEmpty
+        syncSelectedSegmentToCurrentTime()
+        savePlaybackState()
+    }
+
+    private func recordMarkerDeletion(_ deletedMarkers: [Double]) {
+        guard !deletedMarkers.isEmpty else { return }
+        markerDeletionHistory.append(deletedMarkers)
+        if markerDeletionHistory.count > 20 {
+            markerDeletionHistory.removeFirst()
+        }
+        canUndoMarkerDeletion = true
     }
 
     func clearCache() {
@@ -250,7 +323,10 @@ final class LoopPlaybackModel: ObservableObject {
         for key in defaults.dictionaryRepresentation().keys where
             key.hasPrefix("playbackState.") ||
             key == RecentFileKey.videoBookmark ||
-            key == RecentFileKey.subtitleBookmark {
+            key == RecentFileKey.subtitleBookmark ||
+            key == PlaybackSettingKey.repeatCount ||
+            key == PlaybackSettingKey.finiteRepeatCount ||
+            key == PlaybackSettingKey.isInfiniteRepeat {
             defaults.removeObject(forKey: key)
         }
 
@@ -259,10 +335,13 @@ final class LoopPlaybackModel: ObservableObject {
         duration = 0
         currentTime = 0
         markers = []
+        markerDeletionHistory = []
+        canUndoMarkerDeletion = false
         subtitles = []
         subtitleOffset = 0
         selectedSegmentIndex = 0
         repeatCount = 0
+        lastFiniteRepeatCount = 1
         isInfiniteRepeat = false
         completedRepeats = 0
         isPlaying = false
@@ -350,9 +429,13 @@ final class LoopPlaybackModel: ObservableObject {
 
     func setRepeatOption(_ count: Int) {
         repeatCount = count
+        if [1, 3, 5].contains(count) {
+            lastFiniteRepeatCount = count
+        }
         isInfiniteRepeat = false
         completedRepeats = 0
         isTransitioningSegment = false
+        saveRepeatSetting()
         savePlaybackState()
     }
 
@@ -360,6 +443,7 @@ final class LoopPlaybackModel: ObservableObject {
         isInfiniteRepeat = true
         completedRepeats = 0
         isTransitioningSegment = false
+        saveRepeatSetting()
         savePlaybackState()
     }
 
@@ -385,7 +469,7 @@ final class LoopPlaybackModel: ObservableObject {
 
     func cycleFiniteRepeatOption() {
         guard !isInfiniteRepeat, repeatCount > 0 else {
-            setRepeatOption(1)
+            setRepeatOption(lastFiniteRepeatCount)
             return
         }
 
@@ -531,13 +615,39 @@ final class LoopPlaybackModel: ObservableObject {
         UserDefaults.standard.set(data, forKey: playbackStateKey(for: videoURL))
     }
 
+    private func saveRepeatSetting() {
+        let defaults = UserDefaults.standard
+        defaults.set(repeatCount, forKey: PlaybackSettingKey.repeatCount)
+        defaults.set(lastFiniteRepeatCount, forKey: PlaybackSettingKey.finiteRepeatCount)
+        defaults.set(isInfiniteRepeat, forKey: PlaybackSettingKey.isInfiniteRepeat)
+    }
+
+    private func restoreRepeatSetting() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: PlaybackSettingKey.repeatCount) != nil else { return }
+
+        let savedCount = defaults.integer(forKey: PlaybackSettingKey.repeatCount)
+        repeatCount = [0, 1, 3, 5].contains(savedCount) ? savedCount : 0
+        let savedFiniteCount = defaults.integer(forKey: PlaybackSettingKey.finiteRepeatCount)
+        if [1, 3, 5].contains(savedFiniteCount) {
+            lastFiniteRepeatCount = savedFiniteCount
+        } else if [1, 3, 5].contains(repeatCount) {
+            lastFiniteRepeatCount = repeatCount
+        }
+        isInfiniteRepeat = defaults.bool(forKey: PlaybackSettingKey.isInfiniteRepeat)
+    }
+
     private func restorePlaybackState(for url: URL) {
         guard let data = UserDefaults.standard.data(forKey: playbackStateKey(for: url)),
               let state = try? JSONDecoder().decode(PersistedPlaybackState.self, from: data) else { return }
 
         markers = state.markers.sorted()
         repeatCount = state.repeatCount
+        if [1, 3, 5].contains(state.repeatCount) {
+            lastFiniteRepeatCount = state.repeatCount
+        }
         isInfiniteRepeat = state.isInfiniteRepeat
+        saveRepeatSetting()
         isSubtitleVisible = state.isSubtitleVisible
         subtitleOffset = state.subtitleOffset ?? 0
         currentTime = state.currentTime
