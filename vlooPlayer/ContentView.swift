@@ -202,16 +202,7 @@ struct ContentView: View {
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             } else if !isLandscape && areControlsVisible {
                 VStack {
-                    HStack {
-                        Spacer()
-                        Button {
-                            isShowingDocumentPicker = true
-                        } label: {
-                            Image(systemName: "folder")
-                        }
-                        .controlButtonStyle()
-                    }
-                    .padding(12)
+                    playbackHeaderOverlay(isLandscape: false)
                     Spacer()
                 }
             }
@@ -406,66 +397,103 @@ struct ContentView: View {
         ZStack {
             if areControlsVisible {
                 VStack {
-                    HStack {
-                        Spacer()
-                        Button {
-                            isShowingDocumentPicker = true
-                            showLandscapeOverlays()
-                        } label: {
-                            Image(systemName: "folder")
-                        }
-                        .controlButtonStyle()
-                    }
-                    .padding(.horizontal, 24)
-                    .padding(.top, 12)
+                    playbackHeaderOverlay(isLandscape: true)
                     Spacer()
                 }
             }
 
-            VStack(spacing: 10) {
-                VStack(spacing: 6) {
-                    Text(currentSectionLabel)
-                        .font(.caption.monospacedDigit().bold())
-                        .foregroundStyle(.white)
-
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        LazyHStack(spacing: 6) {
-                            ForEach(model.segments) { segment in
-                                segmentRow(for: segment, compact: true)
-                                    .frame(width: 92)
-                            }
-                        }
-                    }
-                    .frame(width: 484, height: 44)
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 0)
-                            .onChanged { _ in showLandscapeOverlays() }
-                            .onEnded { _ in showLandscapeOverlays() }
-                    )
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(
-                    RoundedRectangle(cornerRadius: 14)
-                        .fill(.black.opacity(0.56))
-                )
-                .opacity(areLandscapeSegmentsVisible ? 1 : 0)
-                .allowsHitTesting(areLandscapeSegmentsVisible)
-
-                if areControlsVisible {
+            if areControlsVisible {
+                VStack(spacing: 10) {
                     transportControls(isLandscape: true)
 
                     subtitleSyncControls(isLandscape: true)
 
                     playbackTimeline(isLandscape: true)
-                        .frame(maxWidth: .infinity)
+                        .containerRelativeFrame(.horizontal) { width, _ in
+                            width * 0.8
+                        }
+                        .padding(.top, 10)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.horizontal, 38)
+                .padding(.vertical, 14)
+            }
+
+            if areLandscapeSegmentsVisible {
+                HStack {
+                    Spacer()
+
+                    landscapeSectionList
+                        .padding(.trailing, 18)
+                }
+                .transition(.opacity.combined(with: .move(edge: .trailing)))
+            }
+        }
+    }
+
+    private var landscapeSectionList: some View {
+        VStack(spacing: 6) {
+            Text(currentSectionLabel.isEmpty ? "Sections" : currentSectionLabel)
+                .font(.caption.monospacedDigit().bold())
+                .foregroundStyle(.white)
+
+            ScrollView(.vertical, showsIndicators: false) {
+                LazyVStack(spacing: 6) {
+                    ForEach(model.segments) { segment in
+                        segmentRow(for: segment, compact: true)
+                            .frame(width: 100)
+                    }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.horizontal, 20)
-            .padding(.vertical, 14)
-            .padding(.horizontal, 18)
+            .frame(width: 100, height: 234)
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 8)
+                    .onChanged { _ in showLandscapeOverlays() }
+                    .onEnded { _ in showLandscapeOverlays() }
+            )
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(.black.opacity(0.56))
+        )
+    }
+
+    private func playbackHeaderOverlay(isLandscape: Bool) -> some View {
+        ZStack {
+            if !currentVideoFilename.isEmpty {
+                Text(currentVideoFilename)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .frame(maxWidth: isLandscape ? 420 : 270)
+                    .background(.black.opacity(0.58), in: Capsule())
+            }
+
+            HStack {
+                Spacer()
+
+                Button {
+                    isShowingDocumentPicker = true
+                    if isLandscape {
+                        showLandscapeOverlays()
+                    }
+                } label: {
+                    Image(systemName: "folder")
+                }
+                .controlButtonStyle()
+            }
+        }
+        .padding(.horizontal, isLandscape ? 24 : 12)
+        .padding(.top, 12)
+    }
+
+    private var currentVideoFilename: String {
+        model.videoURL?.lastPathComponent ?? ""
     }
 
     private func segmentRow(for segment: LoopSegment, compact: Bool) -> some View {

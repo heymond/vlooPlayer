@@ -104,7 +104,9 @@ final class LoopPlaybackModel: ObservableObject {
     var currentSubtitle: SubtitleCue? {
         guard isSubtitleVisible else { return nil }
         let subtitleTime = currentTime - subtitleOffset
-        return subtitles.first { subtitleTime >= $0.start && subtitleTime < $0.end }
+        // Overlapping cues are valid. Prefer the newest cue so an older,
+        // longer cue cannot hide the subtitle that starts afterward.
+        return subtitles.last { subtitleTime >= $0.start && subtitleTime < $0.end }
     }
 
     var hasSubtitles: Bool {

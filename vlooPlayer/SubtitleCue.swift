@@ -19,38 +19,64 @@ enum SubtitleParser {
             .replacingOccurrences(of: "\u{feff}", with: "")
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
+            .replacingOccurrences(
+                of: #"\n(?:[ \t]*\n)+"#,
+                with: "\n\n",
+                options: .regularExpression
+            )
 
         if url.pathExtension.lowercased() == "smi" || normalized.localizedCaseInsensitiveContains("<sync") {
             return parseSMI(normalized)
         }
 
-        let cues = normalized
-            .components(separatedBy: "\n\n")
-            .compactMap(parseTimedTextBlock(_:))
-            .sorted { $0.start < $1.start }
+        let cues = parseTimedText(normalized).sorted { $0.start < $1.start }
         return removingRolledUpLines(from: removingDuplicateCues(cues))
     }
 
-    private static func parseTimedTextBlock(_ block: String) -> SubtitleCue? {
-        let lines = block
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map(String.init)
-            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("WEBVTT") }
+    private static func parseTimedText(_ text: String) -> [SubtitleCue] {
+        let lines = text.components(separatedBy: "\n")
+        var cues: [SubtitleCue] = []
+        var index = 0
 
-        guard let timeLineIndex = lines.firstIndex(where: { $0.contains("-->") }) else { return nil }
-        let parts = lines[timeLineIndex].components(separatedBy: "-->")
-        guard parts.count >= 2,
-              let start = parseTime(parts[0]),
-              let end = parseTime(parts[1]) else { return nil }
+        while index < lines.count {
+            guard lines[index].contains("-->") else {
+                index += 1
+                continue
+            }
 
-        let text = cleanText(
-            lines
-                .dropFirst(timeLineIndex + 1)
-                .joined(separator: "\n")
-        )
+            let parts = lines[index].components(separatedBy: "-->")
+            guard parts.count >= 2,
+                  let start = parseTime(parts[0]),
+                  let end = parseTime(parts[1]) else {
+                index += 1
+                continue
+            }
 
-        guard !text.isEmpty else { return nil }
-        return SubtitleCue(start: start, end: end, text: text)
+            index += 1
+            var bodyLines: [String] = []
+            while index < lines.count {
+                if lines[index].contains("-->") {
+                    break
+                }
+
+                let trimmed = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
+                let nextLineIsTime = index + 1 < lines.count && lines[index + 1].contains("-->")
+                if Int(trimmed) != nil && nextLineIsTime {
+                    index += 1
+                    break
+                }
+
+                bodyLines.append(lines[index])
+                index += 1
+            }
+
+            let cueText = cleanText(bodyLines.joined(separator: "\n"))
+            if !cueText.isEmpty, end > start {
+                cues.append(SubtitleCue(start: start, end: end, text: cueText))
+            }
+        }
+
+        return cues
     }
 
     private static func parseSMI(_ text: String) -> [SubtitleCue] {
