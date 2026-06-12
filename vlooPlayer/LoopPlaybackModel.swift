@@ -21,13 +21,19 @@ struct LoopSegment: Identifiable, Equatable {
 final class LoopPlaybackModel: ObservableObject {
     @Published var player = AVPlayer()
     @Published var videoURL: URL?
-    @Published var duration: Double = 0
+    @Published var duration: Double = 0 {
+        didSet { rebuildSegments() }
+    }
     @Published var currentTime: Double = 0
-    @Published var markers: [Double] = []
+    @Published var markers: [Double] = [] {
+        didSet { rebuildSegments() }
+    }
+    @Published private(set) var segments: [LoopSegment] = []
     @Published var selectedSegmentIndex: Int = 0
     @Published var repeatCount: Int = 0
     @Published private(set) var lastFiniteRepeatCount: Int = 1
     @Published var isInfiniteRepeat: Bool = false
+    @Published var autoAdvanceAfterRepeat: Bool = true
     @Published var completedRepeats: Int = 0
     @Published var isPlaying: Bool = false {
         didSet { updateNowPlayingInfo() }
@@ -37,6 +43,7 @@ final class LoopPlaybackModel: ObservableObject {
     @Published var subtitleURL: URL?
     @Published var subtitleOffset: Double = 0
     @Published private(set) var canUndoMarkerDeletion = false
+    @Published private(set) var excludedSegmentStarts: Set<Double> = []
 
     private var timeObserver: Any?
     private var durationObservation: NSKeyValueObservation?
@@ -57,6 +64,7 @@ final class LoopPlaybackModel: ObservableObject {
         static let repeatCount = "lastRepeatCount"
         static let finiteRepeatCount = "lastFiniteRepeatCount"
         static let isInfiniteRepeat = "lastInfiniteRepeat"
+        static let autoAdvanceAfterRepeat = "autoAdvanceAfterRepeat"
     }
 
     private struct PersistedPlaybackState: Codable {
@@ -65,22 +73,58 @@ final class LoopPlaybackModel: ObservableObject {
         let currentTime: Double
         let repeatCount: Int
         let isInfiniteRepeat: Bool
+        let autoAdvanceAfterRepeat: Bool?
+        let excludedSegmentStarts: [Double]?
         let isSubtitleVisible: Bool
         let subtitleOffset: Double?
     }
 
-    var segments: [LoopSegment] {
+    private func rebuildSegments() {
         let points = normalizedBoundaryPoints
-        guard points.count >= 2 else { return [] }
-        return zip(points.indices.dropLast(), points.dropLast()).map { offset, start in
-            LoopSegment(index: offset, start: start, end: points[offset + 1])
+        guard points.count >= 2 else {
+            segments = []
+            return
         }
-        .filter { $0.duration > 0.1 }
+
+        let boundaries = zip(points.dropLast(), points.dropFirst())
+            .filter { start, end in end - start > 0.1 }
+
+        // Reindex after removing tiny ranges. Segment indices are also used as
+        // array positions throughout playback and must always remain contiguous.
+        segments = boundaries.enumerated().map { index, boundary in
+            LoopSegment(index: index, start: boundary.0, end: boundary.1)
+        }
     }
 
     var selectedSegment: LoopSegment? {
         guard segments.indices.contains(selectedSegmentIndex) else { return segments.first }
         return segments[selectedSegmentIndex]
+    }
+
+    var areAllSegmentsPlaybackSelected: Bool {
+        !segments.isEmpty && segments.allSatisfy(isSegmentPlaybackSelected(_:))
+    }
+
+    func isSegmentPlaybackSelected(_ segment: LoopSegment) -> Bool {
+        !excludedSegmentStarts.contains(where: { abs($0 - segment.start) < 0.01 })
+    }
+
+    func toggleSegmentPlaybackSelection(_ segment: LoopSegment) {
+        if let excludedStart = excludedSegmentStarts.first(where: { abs($0 - segment.start) < 0.01 }) {
+            excludedSegmentStarts.remove(excludedStart)
+        } else {
+            excludedSegmentStarts.insert(segment.start)
+        }
+        savePlaybackState()
+    }
+
+    func toggleAllSegmentPlaybackSelections() {
+        if areAllSegmentsPlaybackSelected {
+            excludedSegmentStarts = Set(segments.map(\.start))
+        } else {
+            excludedSegmentStarts.removeAll()
+        }
+        savePlaybackState()
     }
 
     var canRepeatSegment: Bool {
@@ -112,10 +156,8 @@ final class LoopPlaybackModel: ObservableObject {
 
     var currentSubtitle: SubtitleCue? {
         guard isSubtitleVisible else { return nil }
-        let subtitleTime = currentTime - subtitleOffset
-        // Overlapping cues are valid. Prefer the newest cue so an older,
-        // longer cue cannot hide the subtitle that starts afterward.
-        return subtitles.last { subtitleTime >= $0.start && subtitleTime < $0.end }
+        guard let index = subtitleIndex(at: currentTime) else { return nil }
+        return subtitles[index]
     }
 
     var hasSubtitles: Bool {
@@ -127,7 +169,7 @@ final class LoopPlaybackModel: ObservableObject {
             return segments.indices.contains(selectedSegmentIndex) ? selectedSegmentIndex : segments.indices.first
         }
 
-        return segments.first(where: { currentTime >= $0.start && currentTime < $0.end })?.index
+        return segmentIndex(at: currentTime)
             ?? (currentTime >= duration && !segments.isEmpty ? segments.indices.last : nil)
     }
 
@@ -152,6 +194,7 @@ final class LoopPlaybackModel: ObservableObject {
         hasAccessedSecurityScopedResource = url.startAccessingSecurityScopedResource()
         videoURL = url
         markers = []
+        excludedSegmentStarts = []
         markerDeletionHistory = []
         canUndoMarkerDeletion = false
         subtitles = []
@@ -220,10 +263,11 @@ final class LoopPlaybackModel: ObservableObject {
         }
 
         guard !automaticMarkers.isEmpty else { return }
-        markers.append(contentsOf: automaticMarkers.filter { marker in
+        var updatedMarkers = markers
+        updatedMarkers.append(contentsOf: automaticMarkers.filter { marker in
             !markers.contains(where: { abs($0 - marker) < 0.25 })
         })
-        markers.sort()
+        markers = updatedMarkers.sorted()
         syncSelectedSegmentToCurrentTime()
         savePlaybackState()
     }
@@ -239,8 +283,7 @@ final class LoopPlaybackModel: ObservableObject {
         player.cancelPendingPrerolls()
         isTransitioningSegment = false
         completedRepeats = 0
-        markers.append(clampedTime)
-        markers.sort()
+        markers = (markers + [clampedTime]).sorted()
         syncSelectedSegmentToCurrentTime()
         savePlaybackState()
     }
@@ -285,10 +328,11 @@ final class LoopPlaybackModel: ObservableObject {
 
     func undoLastMarkerDeletion() {
         guard let deletedMarkers = markerDeletionHistory.popLast() else { return }
-        markers.append(contentsOf: deletedMarkers.filter { deletedMarker in
+        var restoredMarkers = markers
+        restoredMarkers.append(contentsOf: deletedMarkers.filter { deletedMarker in
             !markers.contains(where: { abs($0 - deletedMarker) < 0.01 })
         })
-        markers.sort()
+        markers = restoredMarkers.sorted()
         canUndoMarkerDeletion = !markerDeletionHistory.isEmpty
         syncSelectedSegmentToCurrentTime()
         savePlaybackState()
@@ -326,7 +370,8 @@ final class LoopPlaybackModel: ObservableObject {
             key == RecentFileKey.subtitleBookmark ||
             key == PlaybackSettingKey.repeatCount ||
             key == PlaybackSettingKey.finiteRepeatCount ||
-            key == PlaybackSettingKey.isInfiniteRepeat {
+            key == PlaybackSettingKey.isInfiniteRepeat ||
+            key == PlaybackSettingKey.autoAdvanceAfterRepeat {
             defaults.removeObject(forKey: key)
         }
 
@@ -335,6 +380,7 @@ final class LoopPlaybackModel: ObservableObject {
         duration = 0
         currentTime = 0
         markers = []
+        excludedSegmentStarts = []
         markerDeletionHistory = []
         canUndoMarkerDeletion = false
         subtitles = []
@@ -343,6 +389,7 @@ final class LoopPlaybackModel: ObservableObject {
         repeatCount = 0
         lastFiniteRepeatCount = 1
         isInfiniteRepeat = false
+        autoAdvanceAfterRepeat = true
         completedRepeats = 0
         isPlaying = false
         isSubtitleVisible = true
@@ -439,6 +486,12 @@ final class LoopPlaybackModel: ObservableObject {
         savePlaybackState()
     }
 
+    func toggleAutoAdvanceAfterRepeat() {
+        autoAdvanceAfterRepeat.toggle()
+        saveRepeatSetting()
+        savePlaybackState()
+    }
+
     func setInfiniteRepeat() {
         isInfiniteRepeat = true
         completedRepeats = 0
@@ -504,16 +557,79 @@ final class LoopPlaybackModel: ObservableObject {
 
     private var normalizedBoundaryPoints: [Double] {
         guard duration > 0 else { return [] }
-        let uniqueMarkers = markers.reduce(into: [Double]()) { result, marker in
-            guard !result.contains(where: { abs($0 - marker) < 0.1 }) else { return }
-            result.append(min(max(marker, 0), duration))
+        var uniqueMarkers: [Double] = []
+        for marker in markers {
+            let clampedMarker = min(max(marker, 0), duration)
+            guard uniqueMarkers.last.map({ abs($0 - clampedMarker) >= 0.1 }) ?? true else { continue }
+            uniqueMarkers.append(clampedMarker)
         }
-        return ([0] + uniqueMarkers + [duration]).sorted()
+        return [0] + uniqueMarkers + [duration]
     }
 
     private func subtitleIndex(at time: Double) -> Int? {
         let subtitleTime = time - subtitleOffset
-        return subtitles.lastIndex { subtitleTime >= $0.start && subtitleTime < $0.end }
+        var lowerBound = 0
+        var upperBound = subtitles.count
+
+        while lowerBound < upperBound {
+            let middle = (lowerBound + upperBound) / 2
+            if subtitles[middle].start <= subtitleTime {
+                lowerBound = middle + 1
+            } else {
+                upperBound = middle
+            }
+        }
+
+        var index = lowerBound - 1
+        while index >= 0 {
+            if subtitleTime < subtitles[index].end { return index }
+            index -= 1
+        }
+        return nil
+    }
+
+    private func segmentIndex(at time: Double) -> Int? {
+        var lowerBound = 0
+        var upperBound = segments.count
+
+        while lowerBound < upperBound {
+            let middle = (lowerBound + upperBound) / 2
+            if segments[middle].start <= time {
+                lowerBound = middle + 1
+            } else {
+                upperBound = middle
+            }
+        }
+
+        let index = lowerBound - 1
+        guard segments.indices.contains(index), time < segments[index].end else { return nil }
+        return index
+    }
+
+    private func hasSubtitle(in segment: LoopSegment) -> Bool {
+        if subtitleIndex(at: segment.start) != nil { return true }
+
+        let subtitleStart = segment.start - subtitleOffset
+        let subtitleEnd = segment.end - subtitleOffset
+        var lowerBound = 0
+        var upperBound = subtitles.count
+
+        while lowerBound < upperBound {
+            let middle = (lowerBound + upperBound) / 2
+            if subtitles[middle].start < subtitleStart {
+                lowerBound = middle + 1
+            } else {
+                upperBound = middle
+            }
+        }
+
+        return subtitles.indices.contains(lowerBound)
+            && subtitles[lowerBound].start < subtitleEnd
+    }
+
+    private func followingSegment(after index: Int) -> LoopSegment? {
+        guard index + 1 < segments.count else { return nil }
+        return segments[index + 1]
     }
 
     private func seekToSubtitle(at index: Int) {
@@ -607,6 +723,8 @@ final class LoopPlaybackModel: ObservableObject {
             currentTime: currentTime,
             repeatCount: repeatCount,
             isInfiniteRepeat: isInfiniteRepeat,
+            autoAdvanceAfterRepeat: autoAdvanceAfterRepeat,
+            excludedSegmentStarts: Array(excludedSegmentStarts),
             isSubtitleVisible: isSubtitleVisible,
             subtitleOffset: subtitleOffset
         )
@@ -620,6 +738,7 @@ final class LoopPlaybackModel: ObservableObject {
         defaults.set(repeatCount, forKey: PlaybackSettingKey.repeatCount)
         defaults.set(lastFiniteRepeatCount, forKey: PlaybackSettingKey.finiteRepeatCount)
         defaults.set(isInfiniteRepeat, forKey: PlaybackSettingKey.isInfiniteRepeat)
+        defaults.set(autoAdvanceAfterRepeat, forKey: PlaybackSettingKey.autoAdvanceAfterRepeat)
     }
 
     private func restoreRepeatSetting() {
@@ -635,6 +754,9 @@ final class LoopPlaybackModel: ObservableObject {
             lastFiniteRepeatCount = repeatCount
         }
         isInfiniteRepeat = defaults.bool(forKey: PlaybackSettingKey.isInfiniteRepeat)
+        if defaults.object(forKey: PlaybackSettingKey.autoAdvanceAfterRepeat) != nil {
+            autoAdvanceAfterRepeat = defaults.bool(forKey: PlaybackSettingKey.autoAdvanceAfterRepeat)
+        }
     }
 
     private func restorePlaybackState(for url: URL) {
@@ -642,11 +764,13 @@ final class LoopPlaybackModel: ObservableObject {
               let state = try? JSONDecoder().decode(PersistedPlaybackState.self, from: data) else { return }
 
         markers = state.markers.sorted()
+        excludedSegmentStarts = Set(state.excludedSegmentStarts ?? [])
         repeatCount = state.repeatCount
         if [1, 3, 5].contains(state.repeatCount) {
             lastFiniteRepeatCount = state.repeatCount
         }
         isInfiniteRepeat = state.isInfiniteRepeat
+        autoAdvanceAfterRepeat = state.autoAdvanceAfterRepeat ?? true
         saveRepeatSetting()
         isSubtitleVisible = state.isSubtitleVisible
         subtitleOffset = state.subtitleOffset ?? 0
@@ -717,8 +841,18 @@ final class LoopPlaybackModel: ObservableObject {
         guard !(repeatCount == 0 && !isInfiniteRepeat) else { return }
         guard seconds >= segment.end else { return }
 
-        if isInfiniteRepeat || completedRepeats < targetPlaybackCount {
+        let shouldRepeatSegment = hasSubtitle(in: segment)
+            && isSegmentPlaybackSelected(segment)
+
+        if shouldRepeatSegment && (isInfiniteRepeat || completedRepeats < targetPlaybackCount) {
             seekAndPlay(segment, revision: playbackRevision, startsNewPlayback: true)
+        } else if autoAdvanceAfterRepeat,
+                  let nextSegment = followingSegment(after: segment.index) {
+            let revision = beginPlaybackTransition()
+            selectedSegmentIndex = nextSegment.index
+            currentTime = nextSegment.start
+            savePlaybackState()
+            seekAndPlay(nextSegment, revision: revision, startsNewPlayback: true)
         } else {
             player.pause()
             isPlaying = false
@@ -785,9 +919,7 @@ final class LoopPlaybackModel: ObservableObject {
             }
         }
 
-        if let matchingIndex = segments.firstIndex(where: { segment in
-            currentTime >= segment.start && currentTime < segment.end
-        }) {
+        if let matchingIndex = segmentIndex(at: currentTime) {
             selectedSegmentIndex = matchingIndex
             return
         }

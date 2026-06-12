@@ -115,7 +115,18 @@ struct ContentView: View {
 
             Spacer(minLength: 0)
 
-            HStack {
+            HStack(spacing: 8) {
+                Button {
+                    model.toggleAllSegmentPlaybackSelections()
+                } label: {
+                    Image(systemName: model.areAllSegmentsPlaybackSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(.blue)
+                        .frame(width: 28, height: 42)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(model.areAllSegmentsPlaybackSelected ? "Disable repeat for all sections" : "Enable repeat for all sections")
+
                 Text("Sections")
                     .font(.headline)
                     .foregroundStyle(.blue)
@@ -262,39 +273,27 @@ struct ContentView: View {
             }
             .accessibilityLabel("Next subtitle")
 
-            Button {
-                model.addMarkerAtCurrentTime()
-                keepControlsVisible(isLandscape: isLandscape)
-            } label: {
-                Image(systemName: "bookmark.fill")
-            }
-            .accessibilityLabel("Add section marker")
-
             Button(action: {}) {
-                ZStack {
-                    Image(systemName: "bookmark.fill")
-
-                    Text("AUTO")
-                        .font(.system(size: 7, weight: .black, design: .rounded))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Color.cyan, in: Capsule())
-                }
-                .frame(width: 34, height: 32)
+                Image(systemName: "bookmark.fill")
             }
             .simultaneousGesture(
                 LongPressGesture(minimumDuration: 1)
-                    .onEnded { _ in
-                        model.addAutomaticSubtitleMarkers()
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    .exclusively(before: TapGesture())
+                    .onEnded { value in
+                        switch value {
+                        case .first:
+                            if model.hasSubtitles {
+                                model.addAutomaticSubtitleMarkers()
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            }
+                        case .second:
+                            model.addMarkerAtCurrentTime()
+                        }
                         keepControlsVisible(isLandscape: isLandscape)
                     }
             )
-            .disabled(!model.hasSubtitles)
-            .opacity(model.hasSubtitles ? 1 : 0.45)
-            .accessibilityLabel("Automatically mark different subtitle lines")
-            .accessibilityHint("Press and hold for one second")
+            .accessibilityLabel("Add section marker")
+            .accessibilityHint("Tap to add a marker, or press and hold for one second to create markers from subtitles")
 
             Button {
                 model.toggleSubtitles()
@@ -381,13 +380,13 @@ struct ContentView: View {
                 .foregroundStyle(.blue)
 
             Button {
-                model.setRepeatOption(0)
+                model.toggleAutoAdvanceAfterRepeat()
             } label: {
                 Image(systemName: "arrow.right")
-                    .repeatModeIcon(isSelected: model.repeatCount == 0 && !model.isInfiniteRepeat)
+                    .repeatModeIcon(isSelected: model.autoAdvanceAfterRepeat)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Continue playback")
+            .accessibilityLabel("Continue to next section after repeating")
 
             Button {
                 model.cycleFiniteRepeatOption()
@@ -556,18 +555,15 @@ struct ContentView: View {
         model.videoURL?.lastPathComponent ?? ""
     }
 
+    @ViewBuilder
     private func segmentRow(for segment: LoopSegment, compact: Bool) -> some View {
         let isCurrent = model.activeSegmentIndex == segment.index
 
-        return Button {
-            if compact {
+        if compact {
+            Button {
                 showLandscapeOverlays()
-            } else {
-                cancelControlsHide()
-            }
-            model.playSegmentImmediately(segment)
-        } label: {
-            if compact {
+                model.playSegmentImmediately(segment)
+            } label: {
                 VStack(spacing: 2) {
                     Text("Section \(segment.index + 1)")
                         .font(.caption.bold())
@@ -578,41 +574,77 @@ struct ContentView: View {
                 .frame(width: 92)
                 .frame(minHeight: 42)
                 .background(isCurrent ? Color.white.opacity(0.92) : Color.white.opacity(0.18), in: Capsule())
-            } else {
-                HStack {
-                    Text("Section \(segment.index + 1)")
-                        .font(.system(size: 16, weight: .semibold))
-
-                    if let subtitleText = subtitlePreview(for: segment) {
-                        Text(subtitleText)
-                            .font(.system(size: 15)) //세로모드 섹션바 자막크기
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                            .truncationMode(.tail)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    } else {
-                        Spacer(minLength: 0)
-                    }
-
-                    Text("\(formattedTime(segment.start)) - \(formattedTime(segment.end))")
-                        .font(.system(size: 14).monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: true, vertical: false)
-                }
-                .padding(.horizontal, 16)
-                .frame(minHeight: 58)
-                .background(isCurrent ? Color.gray.opacity(0.34) : Color(.systemBackground))
-                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+        } else {
+            HStack(spacing: 8) {
+                Button {
+                    model.toggleSegmentPlaybackSelection(segment)
+                } label: {
+                    Image(systemName: model.isSegmentPlaybackSelected(segment) ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 28, height: 44)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    model.isSegmentPlaybackSelected(segment)
+                        ? "Disable repeat for Section \(segment.index + 1)"
+                        : "Enable repeat for Section \(segment.index + 1)"
+                )
+
+                Button {
+                    cancelControlsHide()
+                    model.playSegmentImmediately(segment)
+                } label: {
+                    HStack {
+                        Text("Section \(segment.index + 1)")
+                            .font(.system(size: 16, weight: .semibold))
+
+                        if let subtitleText = subtitlePreview(for: segment) {
+                            Text(subtitleText)
+                                .font(.system(size: 15)) //세로모드 섹션바 자막크기
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .truncationMode(.tail)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        } else {
+                            Spacer(minLength: 0)
+                        }
+
+                        Text("\(formattedTime(segment.start)) - \(formattedTime(segment.end))")
+                            .font(.system(size: 14).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .frame(minHeight: 58)
+                    .background(isCurrent ? Color.gray.opacity(0.34) : Color(.systemBackground))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 16)
         }
-        .buttonStyle(.plain)
     }
 
     private func subtitlePreview(for segment: LoopSegment) -> String? {
-        model.subtitles.first { subtitle in
-            let start = subtitle.start + model.subtitleOffset
-            return start >= segment.start && start < segment.end
-        }?.text.replacingOccurrences(of: "\n", with: " ")
+        let targetStart = segment.start - model.subtitleOffset
+        let targetEnd = segment.end - model.subtitleOffset
+        var lowerBound = 0
+        var upperBound = model.subtitles.count
+
+        while lowerBound < upperBound {
+            let middle = (lowerBound + upperBound) / 2
+            if model.subtitles[middle].start < targetStart {
+                lowerBound = middle + 1
+            } else {
+                upperBound = middle
+            }
+        }
+
+        guard model.subtitles.indices.contains(lowerBound),
+              model.subtitles[lowerBound].start < targetEnd else { return nil }
+        return model.subtitles[lowerBound].text.replacingOccurrences(of: "\n", with: " ")
     }
 
     private var currentSectionLabel: String {
@@ -786,13 +818,16 @@ private struct HowToUseView: View {
     var body: some View {
         NavigationStack {
             List {
-                helpRow("Choose a video", "Tap the folder button and select a video. A subtitle file with the same name is loaded automatically.")
-                helpRow("Show controls", "Tap the video to show the file button and playback controls. They hide automatically after a few seconds.")
-                helpRow("Change orientation", "Swipe up on the video in portrait mode to switch to landscape. Swipe down on the video in landscape mode to return to portrait.")
-                helpRow("Create sections", "Play the video and tap the bookmark button to add a section boundary.")
-                helpRow("Play and delete sections", "Tap a section to play it immediately. Swipe a section left to delete it, or tap Delete All to remove every marker.")
-                helpRow("Repeat", "Use the arrow for continuous playback, the numbered repeat button for 1, 3, or 5 plays, and the repeat icon for endless looping.")
-                helpRow("Subtitles", "Use the previous and next buttons to move between subtitle cues. Tap CC to show or hide subtitles. Use Subtitle Sync to move subtitles earlier or later in 0.5-second steps.")
+                helpRow("Choose a video", "Tap the folder button and select a video. SRT, SMI, or VTT subtitles with the same filename are loaded automatically. The most recent video and playback position are restored when the app opens.")
+                helpRow("Show controls", "Tap the video to show the filename, playback controls, and timeline. Controls hide automatically after 3 seconds. In landscape, the section panel remains visible for 2 seconds after the last interaction.")
+                helpRow("Change orientation", "Swipe up on the video in portrait mode to switch to full-screen landscape. Swipe down in landscape mode to return to portrait.")
+                helpRow("Create sections", "Tap the bookmark button to add a marker at the current time. Press and hold the same button for at least 1 second to automatically create markers whenever the subtitle dialogue changes.")
+                helpRow("Play sections", "Tap any section row to stop the current section and play the selected section immediately. The active section is centered automatically in portrait and landscape lists.")
+                helpRow("Section repeat checks", "A filled circular check means that section uses the selected repeat count. An empty circle means the section plays once without repeating, then continues normally. Use the circle beside Sections to enable or disable repeating for every section.")
+                helpRow("Repeat and continue", "Choose 1, 3, or 5 with the numbered repeat button. Enable the arrow to continue to the next section after the current section finishes its repeats. Disable the arrow to stop after the section. The infinity button repeats continuously. Sections without subtitles never repeat.")
+                helpRow("Delete and undo", "Swipe a section left to delete its marker. Tap Delete All to remove every marker, or use Undo to restore recent individual or bulk deletions.")
+                helpRow("Subtitles", "Use the previous and next buttons to move between subtitle cues, including while paused. Tap the captions icon to show or hide subtitles. Use Subtitle Sync to shift subtitles earlier or later in 0.5-second steps.")
+                helpRow("Landscape controls", "Tap the landscape video to show centered controls, the timeline, and the vertically scrolling section panel on the right. Selecting a section scrolls it to the center of the panel.")
                 helpRow("Background playback", "Audio continues when the app is in the background and playback controls appear on the Lock Screen. Other media audio may pause while the video is playing; phone calls still interrupt playback.")
                 helpRow("Clear cache", "Open the question mark menu and choose Clear Cache to remove recent files, subtitles, markers, sections, playback positions, and saved settings.")
             }
