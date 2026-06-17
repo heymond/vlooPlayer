@@ -6,6 +6,7 @@ struct ContentView: View {
     private let overlayDisplayDuration: Double = 3
     private let landscapeSectionDisplayDuration: Double = 2 //섹션선택 유지시간
 
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = LoopPlaybackModel()
     @State private var isShowingDocumentPicker = false
     @State private var isShowingHelpMenu = false
@@ -16,6 +17,12 @@ struct ContentView: View {
     @State private var areLandscapeSegmentsVisible = false
     @State private var hideControlsWorkItem: DispatchWorkItem?
     @State private var hideLandscapeSegmentsWorkItem: DispatchWorkItem?
+    @State private var timelineScrubTime: Double?
+    @State private var isFineWaveformVisible = false
+    @State private var isFineWaveformLoading = false
+    @State private var fineWaveformSamples: [FineWaveformSample] = []
+    @State private var fineWaveformCenterTime: Double = 0
+    @State private var fineWaveformTask: Task<Void, Never>?
 
     var body: some View {
         GeometryReader { geometry in
@@ -25,12 +32,14 @@ struct ContentView: View {
                 if isLandscape {
                     landscapeLayout
                 } else {
-                    portraitLayout
+                    portraitLayout(width: geometry.size.width)
                 }
             }
+            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
             .background(Color.black)
             .sheet(isPresented: $isShowingDocumentPicker) {
                 VideoDocumentPicker { videoURL, subtitleURL in
+                    hideFineWaveform()
                     model.loadVideo(from: videoURL, subtitle: subtitleURL)
                     isShowingDocumentPicker = false
                     if isLandscape {
@@ -89,17 +98,38 @@ struct ContentView: View {
                     showControlsTemporarily()
                 }
             }
+            .task {
+                await Task.yield()
+                model.loadInitialVideoIfNeeded()
+            }
+            .onChange(of: model.isPlaying) { _, isPlaying in
+                updateIdleTimer(for: isPlaying)
+                if isPlaying {
+                    hideFineWaveform()
+                }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active {
+                    updateIdleTimer(for: model.isPlaying)
+                } else {
+                    updateIdleTimer(for: false)
+                }
+            }
+            .onDisappear {
+                updateIdleTimer(for: false)
+            }
         }
     }
 
-    private var portraitLayout: some View {
+    private func portraitLayout(width: CGFloat) -> some View {
         VStack(spacing: 0) {
             videoSurface(isLandscape: false)
-                .aspectRatio(16 / 9, contentMode: .fit)
+                .frame(width: width, height: width * 9 / 16)
 
             playbackTimeline(isLandscape: false)
                 .padding(.horizontal, 16)
-                .padding(.vertical, 8)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
                 .background(Color(.systemBackground))
 
             repeatSelector
@@ -166,22 +196,54 @@ struct ContentView: View {
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
-                .contentMargins(.vertical, 150, for: .scrollContent)
+                .contentMargins(.top, 0, for: .scrollContent)
+                .contentMargins(.bottom, 150, for: .scrollContent)
                 .background(Color(.systemBackground))
                 .frame(height: 350)
                 .onAppear {
-                    if let activeIndex = model.activeSegmentIndex {
-                        proxy.scrollTo(activeIndex, anchor: .center)
-                    }
+                    scrollPortraitRestoredSectionIfNeeded(proxy)
+                }
+                .onChange(of: model.segments.count) { _, _ in
+                    scrollPortraitRestoredSectionIfNeeded(proxy)
+                }
+                .onChange(of: model.restoredSectionScrollTarget) { _, _ in
+                    scrollPortraitRestoredSectionIfNeeded(proxy)
                 }
                 .onChange(of: model.activeSegmentIndex) { _, activeIndex in
-                    guard let activeIndex else { return }
-                    withAnimation(.easeInOut(duration: 0.25)) {
-                        proxy.scrollTo(activeIndex, anchor: .center)
-                    }
+                    scrollPortraitSectionList(proxy, target: activeIndex)
+                }
+                .onChange(of: model.selectedSegmentIndex) { _, selectedIndex in
+                    scrollPortraitSectionList(proxy, target: selectedIndex)
+                }
+                .onChange(of: model.isPlaying) { _, isPlaying in
+                    guard isPlaying else { return }
+                    scrollPortraitSectionList(proxy)
                 }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private func scrollPortraitSectionList(_ proxy: ScrollViewProxy, target: Int? = nil) {
+        guard !model.isRestoringPlaybackPosition else { return }
+        guard !model.isSuppressingRestoredSectionScroll else { return }
+        guard let target = target ?? model.activeSegmentIndex,
+              model.segments.indices.contains(target) else { return }
+
+        if timelineScrubTime != nil {
+            proxy.scrollTo(target, anchor: .center)
+            return
+        }
+
+        withAnimation(.easeInOut(duration: 0.25)) {
+            proxy.scrollTo(target, anchor: .center)
+        }
+    }
+
+    private func scrollPortraitRestoredSectionIfNeeded(_ proxy: ScrollViewProxy) {
+        guard let target = model.restoredSectionScrollTarget,
+              model.segments.indices.contains(target) else { return }
+        proxy.scrollTo(target, anchor: .center)
     }
 
     private var landscapeLayout: some View {
@@ -191,7 +253,7 @@ struct ContentView: View {
 
     private func videoSurface(isLandscape: Bool) -> some View {
         ZStack {
-            VideoPlayer(player: model.player)
+            FillVideoPlayer(player: model.player, fillsFrame: !isLandscape)
                 .allowsHitTesting(false)
 
             Color.clear
@@ -223,8 +285,31 @@ struct ContentView: View {
                     .shadow(color: .black.opacity(0.65), radius: 3)
                     .padding(.horizontal, 24)
                     .padding(.bottom, 28)
-                    .frame(maxHeight: .infinity, alignment: .bottom)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .allowsHitTesting(false)
+            }
+
+            if !model.isPlaying && isFineWaveformVisible {
+                VStack {
+                    Spacer()
+                    FineWaveformOverlay(
+                        samples: fineWaveformSamples,
+                        centerTime: fineWaveformCenterTime,
+                        duration: model.duration,
+                        isLoading: isFineWaveformLoading,
+                        isLandscape: isLandscape,
+                        onPreview: { seconds in
+                            model.previewFineSeek(to: seconds)
+                        },
+                        onSelect: { seconds in
+                            model.seek(to: seconds)
+                            loadFineWaveform(around: seconds)
+                        }
+                    )
+                    .padding(.horizontal, isLandscape ? 90 : 20)
+                    Spacer()
+                }
+                .transition(.opacity)
             }
 
             if isLandscape && (areControlsVisible || areLandscapeSegmentsVisible) {
@@ -240,6 +325,7 @@ struct ContentView: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity)
         .clipped()
         .animation(.easeOut(duration: 0.18), value: areControlsVisible)
     }
@@ -314,13 +400,23 @@ struct ContentView: View {
 
     private func playbackTimeline(isLandscape: Bool) -> some View {
         HStack(spacing: 8) {
-            Text(formattedTime(model.currentTime))
+            Text(formattedTime(timelineScrubTime ?? model.currentTime))
             Slider(
                 value: Binding(
-                    get: { model.currentTime },
-                    set: { model.seek(to: $0) }
+                    get: { timelineScrubTime ?? model.currentTime },
+                    set: { seconds in
+                        timelineScrubTime = seconds
+                        model.previewSeek(to: seconds)
+                    }
                 ),
-                in: 0...max(model.duration, 0.1)
+                in: 0...max(model.duration, 0.1),
+                onEditingChanged: { isEditing in
+                    guard !isEditing else { return }
+                    let target = timelineScrubTime ?? model.currentTime
+                    timelineScrubTime = nil
+                    model.seek(to: target)
+                    keepControlsVisible(isLandscape: isLandscape)
+                }
             )
             .tint(isLandscape ? .white : .blue)
             Text(formattedTime(model.duration))
@@ -374,7 +470,7 @@ struct ContentView: View {
     }
 
     private var repeatSelector: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 6) {
             Text("Repeat")
                 .font(.headline)
                 .foregroundStyle(.blue)
@@ -382,39 +478,37 @@ struct ContentView: View {
             Button {
                 model.toggleAutoAdvanceAfterRepeat()
             } label: {
-                Image(systemName: "arrow.right")
-                    .repeatModeIcon(isSelected: model.autoAdvanceAfterRepeat)
+                repeatArrowButton
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Continue to next section after repeating")
 
-            Button {
-                model.cycleFiniteRepeatOption()
-            } label: {
-                finiteRepeatIcon
+            ForEach([1, 3, 5], id: \.self) { count in
+                Button {
+                    model.setRepeatOption(count)
+                } label: {
+                    repeatCountButton(count)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Repeat \(count) times")
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Repeat \(model.finiteRepeatDisplayCount) times")
-
-            Button {
-                model.setInfiniteRepeat()
-            } label: {
-                Image(systemName: "repeat")
-                    .repeatModeIcon(isSelected: model.isInfiniteRepeat)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Repeat forever")
 
             Spacer()
 
             Button {
+                toggleFineWaveform()
+            } label: {
+                fineWaveformButtonIcon
+            }
+            .buttonStyle(.plain)
+            .disabled(model.videoURL == nil || model.isPlaying)
+            .opacity(model.videoURL == nil || model.isPlaying ? 0.45 : 1)
+            .accessibilityLabel(isFineWaveformVisible ? "Hide fine waveform" : "Show fine waveform")
+
+            Button {
                 isShowingHelpMenu = true
             } label: {
-                Image(systemName: "questionmark.circle")
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(.blue)
-                    .frame(width: 52, height: 48)
-                    .contentShape(Rectangle())
+                questionButtonIcon
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Help and cache menu")
@@ -423,22 +517,64 @@ struct ContentView: View {
         .padding(.vertical, 8)
     }
 
-    private var finiteRepeatIcon: some View {
-        ZStack(alignment: .bottomLeading) {
-            Image(systemName: "repeat")
-                .font(.system(size: 28, weight: .semibold))
-                .frame(width: 52, height: 38)
+    private func repeatCountButton(_ count: Int) -> some View {
+        let isSelected = model.repeatCount == count && !model.isInfiniteRepeat
 
-            Text("\(model.finiteRepeatDisplayCount)")
-                .font(.system(size: 11, weight: .black, design: .rounded))
-                .foregroundStyle(.white)
-                .frame(width: 21, height: 21)
-                .background(Color.cyan, in: Circle())
-                .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2))
-                .offset(x: -1, y: 2)
+        return ZStack {
+            Image(systemName: isSelected ? "circle.fill" : "circle")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(Color.blue)
+
+            Text("\(count)")
+                .font(.system(size: 12, weight: .black, design: .rounded))
+                .foregroundStyle(isSelected ? Color.white : Color.blue)
         }
-        .foregroundStyle(model.repeatCount > 0 && !model.isInfiniteRepeat ? Color.blue : Color.primary)
-        .contentShape(Rectangle())
+        .contentShape(Circle())
+            .frame(width: 38, height: 38)
+    }
+
+    private var repeatArrowButton: some View {
+        let isSelected = model.autoAdvanceAfterRepeat
+
+        return ZStack {
+            Image(systemName: isSelected ? "circle.fill" : "circle")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(Color.blue)
+
+            Image(systemName: "arrow.right")
+                .font(.system(size: 11, weight: .black))
+                .foregroundStyle(isSelected ? Color.white : Color.blue)
+        }
+        .contentShape(Circle())
+        .frame(width: 38, height: 38)
+    }
+
+    private var fineWaveformButtonIcon: some View {
+        ZStack {
+            Image(systemName: isFineWaveformVisible ? "circle.fill" : "circle")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(Color.blue)
+
+            Image(systemName: "waveform")
+                .font(.system(size: 10, weight: .black))
+                .foregroundStyle(isFineWaveformVisible ? Color.white : Color.blue)
+        }
+        .contentShape(Circle())
+        .frame(width: 38, height: 38)
+    }
+
+    private var questionButtonIcon: some View {
+        ZStack {
+            Image(systemName: "circle")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(Color.blue)
+
+            Text("?")
+                .font(.system(size: 12, weight: .black, design: .rounded))
+                .foregroundStyle(Color.blue)
+        }
+        .contentShape(Circle())
+            .frame(width: 38, height: 38)
     }
 
     private var landscapeControlsOverlay: some View {
@@ -502,21 +638,53 @@ struct ContentView: View {
                         .onEnded { _ in showLandscapeOverlays() }
                 )
                 .onAppear {
-                    proxy.scrollTo(model.selectedSegmentIndex, anchor: .center)
+                    if let target = model.restoredSectionScrollTarget,
+                       model.segments.indices.contains(target) {
+                        proxy.scrollTo(target, anchor: .center)
+                    } else if !model.isRestoringPlaybackPosition && !model.isSuppressingRestoredSectionScroll {
+                        proxy.scrollTo(model.selectedSegmentIndex, anchor: .center)
+                    }
+                }
+                .onChange(of: model.segments.count) { _, _ in
+                    scrollLandscapeRestoredSectionIfNeeded(proxy)
+                }
+                .onChange(of: model.restoredSectionScrollTarget) { _, _ in
+                    scrollLandscapeRestoredSectionIfNeeded(proxy)
                 }
                 .onChange(of: model.selectedSegmentIndex) { _, selectedIndex in
-                    withAnimation(.easeInOut(duration: 0.22)) {
+                    guard !model.isRestoringPlaybackPosition else { return }
+                    guard !model.isSuppressingRestoredSectionScroll else { return }
+                    if timelineScrubTime != nil {
                         proxy.scrollTo(selectedIndex, anchor: .center)
+                    } else {
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            proxy.scrollTo(selectedIndex, anchor: .center)
+                        }
+                    }
+                }
+                .onChange(of: model.isPlaying) { _, isPlaying in
+                    guard isPlaying else { return }
+                    guard !model.isRestoringPlaybackPosition else { return }
+                    guard !model.isSuppressingRestoredSectionScroll else { return }
+                    guard let activeIndex = model.activeSegmentIndex else { return }
+                    withAnimation(.easeInOut(duration: 0.22)) {
+                        proxy.scrollTo(activeIndex, anchor: .center)
                     }
                 }
             }
         }
-        .padding(.horizontal, 10)
+         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 14)
                 .fill(.black.opacity(0.56))
         )
+    }
+
+    private func scrollLandscapeRestoredSectionIfNeeded(_ proxy: ScrollViewProxy) {
+        guard let target = model.restoredSectionScrollTarget,
+              model.segments.indices.contains(target) else { return }
+        proxy.scrollTo(target, anchor: .center)
     }
 
     private func playbackHeaderOverlay(isLandscape: Bool) -> some View {
@@ -734,6 +902,196 @@ struct ContentView: View {
         hideLandscapeSegmentsWorkItem?.cancel()
         hideLandscapeSegmentsWorkItem = nil
     }
+
+    private func toggleFineWaveform() {
+        guard model.videoURL != nil, !model.isPlaying else { return }
+        if isFineWaveformVisible {
+            hideFineWaveform()
+        } else {
+            isFineWaveformVisible = true
+            loadFineWaveform(around: model.currentTime)
+        }
+    }
+
+    private func hideFineWaveform() {
+        fineWaveformTask?.cancel()
+        fineWaveformTask = nil
+        isFineWaveformVisible = false
+        isFineWaveformLoading = false
+        fineWaveformSamples = []
+    }
+
+    private func loadFineWaveform(around seconds: Double) {
+        fineWaveformTask?.cancel()
+        let upperBound = model.duration > 0 ? model.duration : seconds
+        let clampedSeconds = min(max(seconds, 0), max(upperBound, 0))
+        fineWaveformCenterTime = clampedSeconds
+        fineWaveformSamples = []
+        isFineWaveformLoading = true
+
+        fineWaveformTask = Task { @MainActor in
+            let samples = await model.fineWaveformSamples(around: clampedSeconds)
+            guard !Task.isCancelled else { return }
+            fineWaveformCenterTime = clampedSeconds
+            fineWaveformSamples = samples
+            isFineWaveformLoading = false
+        }
+    }
+
+    private func updateIdleTimer(for isPlaying: Bool) {
+        UIApplication.shared.isIdleTimerDisabled = isPlaying
+    }
+}
+
+private struct FineWaveformOverlay: View {
+    let samples: [FineWaveformSample]
+    let centerTime: Double
+    let duration: Double
+    let isLoading: Bool
+    let isLandscape: Bool
+    let onPreview: (Double) -> Void
+    let onSelect: (Double) -> Void
+
+    @State private var selectedTime: Double?
+
+    private let radius = 1.0
+    private let barCount = 96
+
+    var body: some View {
+        GeometryReader { geometry in
+            let window = visibleWindow
+            let activeTime = selectedTime ?? centerTime
+            let centerX = xPosition(for: centerTime, width: geometry.size.width, window: window)
+            let activeX = xPosition(for: activeTime, width: geometry.size.width, window: window)
+
+            ZStack {
+                VStack(spacing: 6) {
+                    header(activeTime: activeTime)
+                    ZStack {
+                        HStack(alignment: .center, spacing: 1) {
+                            ForEach(0..<barCount, id: \.self) { index in
+                                let time = timeForBar(index, window: window)
+                                let level = level(at: time)
+                                Capsule()
+                                    .fill(Color.cyan.opacity(level > 0 ? 0.62 : 0.18))
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: max(3, CGFloat(level) * waveformHeight))
+                            }
+                        }
+
+                        Rectangle()
+                            .fill(Color.red.opacity(0.76))
+                            .frame(width: 1.5)
+                            .offset(x: centerX - geometry.size.width / 2)
+
+                        Rectangle()
+                            .fill(Color.yellow.opacity(0.76))
+                            .frame(width: 1.5)
+                            .offset(x: activeX - geometry.size.width / 2)
+                            .opacity(selectedTime == nil ? 0 : 1)
+                    }
+                    .frame(height: waveformHeight)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                let target = time(at: value.location.x, width: geometry.size.width, window: window)
+                                selectedTime = target
+                                onPreview(target)
+                            }
+                            .onEnded { value in
+                                let target = time(at: value.location.x, width: geometry.size.width, window: window)
+                                selectedTime = nil
+                                onSelect(target)
+                            }
+                    )
+                }
+                .padding(.horizontal, 11)
+                .padding(.vertical, 9)
+
+                if isLoading {
+                    ProgressView()
+                        .tint(.white)
+                }
+            }
+        }
+        .frame(height: isLandscape ? 82 : 76)
+    }
+
+    private var waveformHeight: CGFloat {
+        isLandscape ? 51 : 45
+    }
+
+    private func header(activeTime: Double) -> some View {
+        HStack {
+            Text("Fine position")
+            Spacer()
+            Text(offsetText(for: activeTime))
+        }
+        .font(.caption2.monospacedDigit().weight(.semibold))
+        .foregroundStyle(Color.white.opacity(0.86))
+    }
+
+    private var visibleWindow: (start: Double, end: Double) {
+        let safeDuration = duration > 0 ? duration : centerTime + radius
+        let start = max(0, centerTime - radius)
+        let end = min(max(safeDuration, centerTime + radius), centerTime + radius)
+        return (start, max(start + 0.05, end))
+    }
+
+    private func timeForBar(_ index: Int, window: (start: Double, end: Double)) -> Double {
+        let progress = (Double(index) + 0.5) / Double(barCount)
+        return window.start + (window.end - window.start) * progress
+    }
+
+    private func time(at xPosition: CGFloat, width: CGFloat, window: (start: Double, end: Double)) -> Double {
+        guard width > 0 else { return centerTime }
+        let progress = min(max(Double(xPosition / width), 0), 1)
+        return window.start + (window.end - window.start) * progress
+    }
+
+    private func xPosition(for time: Double, width: CGFloat, window: (start: Double, end: Double)) -> CGFloat {
+        guard window.end > window.start else { return width / 2 }
+        let progress = min(max((time - window.start) / (window.end - window.start), 0), 1)
+        return CGFloat(progress) * width
+    }
+
+    private func level(at time: Double) -> Double {
+        guard !samples.isEmpty else { return 0 }
+        let insertionIndex = insertionIndex(for: time)
+        let candidateIndexes = [insertionIndex - 1, insertionIndex, insertionIndex + 1]
+
+        var nearestLevel = 0.0
+        var nearestDistance = Double.greatestFiniteMagnitude
+        for index in candidateIndexes where samples.indices.contains(index) {
+            let sample = samples[index]
+            let distance = abs(sample.time - time)
+            if distance < nearestDistance {
+                nearestDistance = distance
+                nearestLevel = sample.level
+            }
+        }
+        return nearestLevel
+    }
+
+    private func insertionIndex(for time: Double) -> Int {
+        var lowerBound = 0
+        var upperBound = samples.count
+        while lowerBound < upperBound {
+            let middle = (lowerBound + upperBound) / 2
+            if samples[middle].time < time {
+                lowerBound = middle + 1
+            } else {
+                upperBound = middle
+            }
+        }
+        return lowerBound
+    }
+
+    private func offsetText(for time: Double) -> String {
+        let offset = time - centerTime
+        return String(format: "%+.2fs", offset)
+    }
 }
 
 private struct HelpMenuView: View {
@@ -849,15 +1207,74 @@ private struct HowToUseView: View {
     }
 }
 
-private extension View {
-    func repeatModeIcon(isSelected: Bool) -> some View {
-        self
-            .font(.system(size: 28, weight: .semibold))
-            .foregroundStyle(isSelected ? Color.blue : Color.primary)
-            .frame(width: 44, height: 38)
-            .contentShape(Rectangle())
+private struct FillVideoPlayer: UIViewRepresentable {
+    let player: AVPlayer
+    let fillsFrame: Bool
+    private var cropScale: CGFloat {
+        fillsFrame ? 1.45 : 1
     }
 
+    func makeUIView(context: Context) -> PlayerLayerView {
+        let view = PlayerLayerView()
+        view.playerLayer.player = player
+        view.playerLayer.videoGravity = fillsFrame ? .resizeAspectFill : .resizeAspect
+        view.cropScale = cropScale
+        return view
+    }
+
+    func updateUIView(_ uiView: PlayerLayerView, context: Context) {
+        uiView.playerLayer.player = player
+        uiView.playerLayer.videoGravity = fillsFrame ? .resizeAspectFill : .resizeAspect
+        uiView.cropScale = cropScale
+    }
+}
+
+private final class PlayerLayerView: UIView {
+    let playerLayer = AVPlayerLayer()
+
+    var cropScale: CGFloat = 1 {
+        didSet {
+            updatePlayerLayerFrame()
+        }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        layer.addSublayer(playerLayer)
+        playerLayer.videoGravity = .resizeAspect
+        backgroundColor = .black
+        clipsToBounds = true
+        layer.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        layer.addSublayer(playerLayer)
+        playerLayer.videoGravity = .resizeAspect
+        backgroundColor = .black
+        clipsToBounds = true
+        layer.masksToBounds = true
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        updatePlayerLayerFrame()
+    }
+
+    private func updatePlayerLayerFrame() {
+        let scale = max(cropScale, 1)
+        let scaledWidth = bounds.width * scale
+        let scaledHeight = bounds.height * scale
+        playerLayer.frame = CGRect(
+            x: (bounds.width - scaledWidth) / 2,
+            y: (bounds.height - scaledHeight) / 2,
+            width: scaledWidth,
+            height: scaledHeight
+        )
+    }
+}
+
+private extension View {
     func controlButtonStyle() -> some View {
         self
             .font(.system(size: 19, weight: .semibold))
