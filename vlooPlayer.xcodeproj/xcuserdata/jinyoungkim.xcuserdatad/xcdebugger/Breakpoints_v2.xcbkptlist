@@ -32,7 +32,7 @@
             endingColumnNumber = "9223372036854775807"
             startingLineNumber = "913"
             endingLineNumber = "913"
-            landmarkName = "toggleFineWaveform()"
+            landmarkName = "requestOrientation(_:)"
             landmarkType = "7">
          </BreakpointContent>
       </BreakpointProxy>

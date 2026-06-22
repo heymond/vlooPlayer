@@ -5,6 +5,7 @@ import UIKit
 struct ContentView: View {
     private let overlayDisplayDuration: Double = 3
     private let landscapeSectionDisplayDuration: Double = 2 //섹션선택 유지시간
+    private let iPadWindowTopVideoInset: CGFloat = 20
 
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = LoopPlaybackModel()
@@ -37,6 +38,7 @@ struct ContentView: View {
             }
             .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
             .background(Color.black)
+            .preferredColorScheme(.dark)
             .sheet(isPresented: $isShowingDocumentPicker) {
                 VideoDocumentPicker { videoURL, subtitleURL in
                     hideFineWaveform()
@@ -123,6 +125,11 @@ struct ContentView: View {
 
     private func portraitLayout(width: CGFloat) -> some View {
         VStack(spacing: 0) {
+            if isPad {
+                Color.black
+                    .frame(height: iPadWindowTopVideoInset)
+            }
+
             videoSurface(isLandscape: false)
                 .frame(width: width, height: width * 9 / 16)
 
@@ -130,20 +137,21 @@ struct ContentView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
                 .padding(.bottom, 4)
-                .background(Color(.systemBackground))
+                .background(Color.black)
 
             repeatSelector
-                .background(Color(.systemBackground))
+                .background(Color.black)
 
             transportControls(isLandscape: false)
                 .padding(.vertical, 4)
-                .background(Color(.systemBackground))
+                .background(Color.black)
 
             subtitleSyncControls(isLandscape: false)
                 .padding(.bottom, 6)
-                .background(Color(.systemBackground))
+                .background(Color.black)
 
-            Spacer(minLength: 0)
+            Color.black
+                .frame(height: 0)
 
             HStack(spacing: 8) {
                 Button {
@@ -175,7 +183,7 @@ struct ContentView: View {
             }
             .padding(.horizontal, 16)
             .frame(height: 42)
-            .background(Color(.systemBackground))
+            .background(Color.black)
 
             ScrollViewReader { proxy in
                 List {
@@ -184,6 +192,7 @@ struct ContentView: View {
                             .id(segment.index)
                             .listRowInsets(EdgeInsets())
                             .listRowSeparator(.hidden)
+                            .listRowBackground(Color.black)
                             .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                                 Button(role: .destructive) {
                                     model.removeSegments(at: IndexSet(integer: segment.index))
@@ -198,8 +207,9 @@ struct ContentView: View {
                 .scrollContentBackground(.hidden)
                 .contentMargins(.top, 0, for: .scrollContent)
                 .contentMargins(.bottom, 150, for: .scrollContent)
-                .background(Color(.systemBackground))
-                .frame(height: 350)
+                .background(Color.black)
+                .frame(height: isPad ? nil : 350)
+                .frame(maxHeight: isPad ? .infinity : nil)
                 .onAppear {
                     scrollPortraitRestoredSectionIfNeeded(proxy)
                 }
@@ -248,7 +258,13 @@ struct ContentView: View {
 
     private var landscapeLayout: some View {
         videoSurface(isLandscape: true)
-            .ignoresSafeArea()
+            .padding(.top, isPad ? iPadWindowTopVideoInset : 0)
+            .background(Color.black)
+            .ignoresSafeArea(edges: isPad ? [] : .all)
+    }
+
+    private var isPad: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad
     }
 
     private func videoSurface(isLandscape: Bool) -> some View {
@@ -786,7 +802,7 @@ struct ContentView: View {
                             .fixedSize(horizontal: true, vertical: false)
                     }
                     .frame(minHeight: 58)
-                    .background(isCurrent ? Color.gray.opacity(0.34) : Color(.systemBackground))
+                    .background(isCurrent ? Color.gray.opacity(0.34) : Color.black)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -1113,8 +1129,9 @@ private struct HelpMenuView: View {
 
                 menuButton(
                     title: "Script to SRT",
-                    detail: "Load an available YouTube script and export an SRT file.",
+                    detail: "Temporarily disabled.",
                     systemImage: "captions.bubble.fill",
+                    isDisabled: true,
                     action: showScriptToSRT
                 )
 
@@ -1141,6 +1158,7 @@ private struct HelpMenuView: View {
         detail: String,
         systemImage: String,
         role: ButtonRole? = nil,
+        isDisabled: Bool = false,
         action: @escaping () -> Void
     ) -> some View {
         Button(role: role, action: action) {
@@ -1165,8 +1183,10 @@ private struct HelpMenuView: View {
             }
             .frame(maxWidth: .infinity, minHeight: 60, alignment: .leading)
             .contentShape(Rectangle())
+            .opacity(isDisabled ? 0.45 : 1)
         }
         .buttonStyle(.plain)
+        .disabled(isDisabled)
     }
 }
 
@@ -1211,20 +1231,20 @@ private struct FillVideoPlayer: UIViewRepresentable {
     let player: AVPlayer
     let fillsFrame: Bool
     private var cropScale: CGFloat {
-        fillsFrame ? 1.45 : 1
+        1
     }
 
     func makeUIView(context: Context) -> PlayerLayerView {
         let view = PlayerLayerView()
         view.playerLayer.player = player
-        view.playerLayer.videoGravity = fillsFrame ? .resizeAspectFill : .resizeAspect
+        view.playerLayer.videoGravity = .resizeAspect
         view.cropScale = cropScale
         return view
     }
 
     func updateUIView(_ uiView: PlayerLayerView, context: Context) {
         uiView.playerLayer.player = player
-        uiView.playerLayer.videoGravity = fillsFrame ? .resizeAspectFill : .resizeAspect
+        uiView.playerLayer.videoGravity = .resizeAspect
         uiView.cropScale = cropScale
     }
 }
